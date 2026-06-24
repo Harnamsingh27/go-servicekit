@@ -8,7 +8,7 @@ import (
 )
 
 // APIKeyHeader is the HTTP header used for API key authentication.
-const APIKeyHeader = "X-API-Key"
+const APIKeyHeader = "X-API-Key" //nolint:gosec
 
 // KeyStore validates API keys. Implementations may check env vars, a database,
 // or any other backing store.

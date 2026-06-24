@@ -32,8 +32,8 @@ func WithClientTimeout(d time.Duration) ClientOption {
 
 // WithRetry sets the maximum number of retry attempts and the initial backoff.
 // Backoff doubles on each retry (exponential).
-func WithRetry(max int, baseBackoff time.Duration) ClientOption {
-	return func(c *clientConfig) { c.retryMax = max; c.baseBackoff = baseBackoff }
+func WithRetry(maxAttempts int, baseBackoff time.Duration) ClientOption {
+	return func(c *clientConfig) { c.retryMax = maxAttempts; c.baseBackoff = baseBackoff }
 }
 
 // WithTransport replaces the underlying http.RoundTripper.
@@ -98,7 +98,7 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*http.Response, err
 			return resp, nil
 		}
 		// 5xx — close body and retry.
-		resp.Body.Close() //nolint:errcheck
+		resp.Body.Close() //nolint:errcheck,gosec
 		lastErr = fmt.Errorf("httpx: server returned %d", resp.StatusCode)
 	}
 	return nil, fmt.Errorf("httpx: all %d attempts failed: %w", c.retryMax+1, lastErr)

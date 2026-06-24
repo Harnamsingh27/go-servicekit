@@ -122,7 +122,7 @@ func applyDefaults(rv reflect.Value) error {
 }
 
 func applyYAMLFile(path string, cfg any) error {
-	f, err := os.Open(path)
+	f, err := os.Open(path) //nolint:gosec
 	if err != nil {
 		return fmt.Errorf("open %q: %w", path, err)
 	}
@@ -137,7 +137,7 @@ func applyYAMLFile(path string, cfg any) error {
 }
 
 func parseEnvFile(path string) (map[string]string, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) //nolint:gosec
 	if err != nil {
 		return nil, fmt.Errorf("open %q: %w", path, err)
 	}
