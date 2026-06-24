@@ -1,4 +1,4 @@
-﻿package config_test
+package config_test
 
 import (
 	"fmt"
@@ -10,22 +10,19 @@ import (
 	"github.com/harnamsingh/go-servicekit/config"
 )
 
-// testConfig is a flat config struct used across most tests.
 type testConfig struct {
-	Host     string        `yaml:"host"     env:"TC_HOST"    default:"localhost"`
-	Port     int           `yaml:"port"     env:"TC_PORT"    default:"8080"`
-	Debug    bool          `yaml:"debug"    env:"TC_DEBUG"   default:"false"`
-	Timeout  time.Duration `yaml:"timeout"  env:"TC_TIMEOUT" default:"30s"`
-	Secret   string        `yaml:"secret"   env:"TC_SECRET"  validate:"required"`
-	Score    float64       `yaml:"score"    env:"TC_SCORE"   default:"1.5"`
+	Host    string        `yaml:"host"    env:"TC_HOST"    default:"localhost"`
+	Port    int           `yaml:"port"    env:"TC_PORT"    default:"8080"`
+	Debug   bool          `yaml:"debug"   env:"TC_DEBUG"   default:"false"`
+	Timeout time.Duration `yaml:"timeout" env:"TC_TIMEOUT" default:"30s"`
+	Secret  string        `yaml:"secret"  env:"TC_SECRET"  validate:"required"`
+	Score   float64       `yaml:"score"   env:"TC_SCORE"   default:"1.5"`
 }
 
-// requiredConfig has a required field with no default.
 type requiredConfig struct {
 	Token string `env:"TC_TOKEN" validate:"required"`
 }
 
-// validatedConfig implements Validator.
 type validatedConfig struct {
 	Port int `yaml:"port" env:"TC_VAL_PORT" default:"0"`
 }
@@ -37,7 +34,6 @@ func (v *validatedConfig) Validate() error {
 	return nil
 }
 
-// nestedConfig tests struct nesting.
 type nestedConfig struct {
 	Server struct {
 		Host string `yaml:"host" env:"TC_N_HOST" default:"0.0.0.0"`
@@ -58,7 +54,6 @@ func writeTemp(t *testing.T, ext, content string) string {
 	return f.Name()
 }
 
-// unsetEnv removes the env var and restores it after the test.
 func setEnv(t *testing.T, key, val string) {
 	t.Helper()
 	old, had := os.LookupEnv(key)
@@ -83,8 +78,6 @@ func unsetEnv(t *testing.T, key string) {
 	})
 }
 
-// ---- Tests ---------------------------------------------------------------
-
 func TestLoad_Defaults(t *testing.T) {
 	unsetEnv(t, "TC_HOST")
 	unsetEnv(t, "TC_PORT")
@@ -97,7 +90,7 @@ func TestLoad_Defaults(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	if cfg.Host != "localhost" {
-		t.Errorf("Host = %q, want %q", cfg.Host, "localhost")
+		t.Errorf("Host = %q, want localhost", cfg.Host)
 	}
 	if cfg.Port != 8080 {
 		t.Errorf("Port = %d, want 8080", cfg.Port)
@@ -132,8 +125,8 @@ func TestLoad_YAMLFile(t *testing.T) {
 	unsetEnv(t, "TC_PORT")
 	unsetEnv(t, "TC_SECRET")
 
-	yaml := "host: yaml.host\nport: 9999\nsecret: yamlsecret\n"
-	path := writeTemp(t, ".yaml", yaml)
+	yamlContent := "host: yaml.host\nport: 9999\nsecret: yamlsecret\n"
+	path := writeTemp(t, ".yaml", yamlContent)
 
 	cfg, err := config.Load[testConfig](config.WithYAMLFile(path))
 	if err != nil {
@@ -177,7 +170,6 @@ func TestLoad_EnvOverridesEnvFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	// System env var wins over .env file.
 	if cfg.Host != "sysenv.host" {
 		t.Errorf("Host = %q, want sysenv.host", cfg.Host)
 	}
@@ -207,7 +199,7 @@ func TestLoad_MissingRequiredField(t *testing.T) {
 	}
 }
 
-func TestLoad_InvalidType(t *testing.T) {
+func TestLoad_InvalidInt(t *testing.T) {
 	setEnv(t, "TC_PORT", "notanumber")
 	setEnv(t, "TC_SECRET", "s3cr3t")
 
