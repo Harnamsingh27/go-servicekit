@@ -1,70 +1,88 @@
 package httpx
 
 import (
+	"fmt"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"time"
 
 	"github.com/harnamsingh/go-servicekit/observability"
 )
 
-// Chain wraps handler with middlewares applied outermost-first.
-// The first middleware in the slice is the outermost (runs first on a request,
-// last on a response).
-func Chain(h http.Handler, middlewares ...func(http.Handler) http.Handler) http.Handler {
-	for i := len(middlewares) - 1; i >= 0; i-- {
-		h = middlewares[i](h)
-	}
-	return h
-}
-
-// RequestIDMiddleware reuses the X-Request-ID header if present, otherwise
-// generates a new ID. It stores the ID in context and echoes it back in the
-// response.
-func RequestIDMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rid := r.Header.Get("X-Request-ID")
-		if rid == "" {
-			rid = observability.NewRequestID()
-		}
-		ctx := observability.WithRequestID(r.Context(), rid)
-		w.Header().Set("X-Request-ID", rid)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
-}
-
-// LoggingMiddleware logs each request's method, path, status code, and latency
-// using the structured logger. It uses the logger attached to the request
-// context if present, otherwise falls back to the slog default.
-func LoggingMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
+// PanicRecoveryMiddleware catches panics in downstream handlers, logs the stack
+// trace, and returns 500 Internal Server Error without crashing the server.
+func PanicRecoveryMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					stack := string(debug.Stack())
+					logger.ErrorContext(r.Context(), "panic recovered",
+						slog.Any("panic", rec),
+						slog.String("stack", stack),
+					)
+					http.Error(w, "internal server error", http.StatusInternalServerError)
+				}
+			}()
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// statusWriter wraps ResponseWriter to capture the HTTP status code.
+type statusWriter struct {
+	http.ResponseWriter
+	status  int
+	written int64
+}
+
+func (sw *statusWriter) WriteHeader(code int) {
+	sw.status = code
+	sw.ResponseWriter.WriteHeader(code)
+}
+
+func (sw *statusWriter) Write(b []byte) (int, error) {
+	n, err := sw.ResponseWriter.Write(b)
+	sw.written += int64(n)
+	return n, err
+}
+
+// AccessLogMiddleware records one structured log line per request with method,
+// path, status, latency, and request ID.
+func AccessLogMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 			start := time.Now()
-			rw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
-			next.ServeHTTP(rw, r)
+			next.ServeHTTP(sw, r)
 			logger.InfoContext(r.Context(), "http request",
 				slog.String("method", r.Method),
 				slog.String("path", r.URL.Path),
-				slog.Int("status", rw.code),
-				slog.Duration("latency", time.Since(start)),
-				slog.String("request_id", observability.RequestIDFromContext(r.Context())),
+				slog.Int("status", sw.status),
+				slog.String("latency", time.Since(start).String()),
+				slog.String("remote_addr", r.RemoteAddr),
 			)
 		})
 	}
 }
 
-// statusWriter captures the HTTP status code so it can be logged after the
-// handler writes the response.
-type statusWriter struct {
-	http.ResponseWriter
-	code    int
-	written bool
+// TimeoutMiddleware cancels the request context after d and returns 503 if the
+// handler has not responded in time.
+func TimeoutMiddleware(d time.Duration) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.TimeoutHandler(next, d, fmt.Sprintf("request timed out after %s", d))
+	}
 }
 
-func (sw *statusWriter) WriteHeader(code int) {
-	if !sw.written {
-		sw.code = code
-		sw.written = true
+// DefaultMiddleware returns the standard ordered middleware chain:
+//
+//	PanicRecovery → RequestID → AccessLog → Timeout
+func DefaultMiddleware(logger *slog.Logger, timeout time.Duration) []func(http.Handler) http.Handler {
+	return []func(http.Handler) http.Handler{
+		PanicRecoveryMiddleware(logger),
+		observability.RequestIDMiddleware,
+		AccessLogMiddleware(logger),
+		TimeoutMiddleware(timeout),
 	}
-	sw.ResponseWriter.WriteHeader(code)
 }
