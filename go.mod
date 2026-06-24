@@ -1,6 +1,6 @@
 module github.com/harnamsingh/go-servicekit
 
-go 1.26.4
+go 1.24
 
 require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
