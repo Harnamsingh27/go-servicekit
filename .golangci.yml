@@ -21,7 +21,7 @@ linters:
 
 linters-settings:
   goimports:
-    local-prefixes: go-servicekit
+    local-prefixes: github.com/harnamsingh/go-servicekit
   revive:
     rules:
       - name: exported

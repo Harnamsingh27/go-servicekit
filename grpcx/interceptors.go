@@ -3,7 +3,7 @@ package grpcx
 import (
 	"context"
 
-	"go-servicekit/observability"
+	"github.com/harnamsingh/go-servicekit/observability"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )

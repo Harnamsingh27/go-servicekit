@@ -1,11 +1,11 @@
-package errors_test
+﻿package errors_test
 
 import (
 	"fmt"
 	"net/http"
 	"testing"
 
-	"go-servicekit/errors"
+	"github.com/harnamsingh/go-servicekit/errors"
 
 	"google.golang.org/grpc/codes"
 )

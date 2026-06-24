@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"go-servicekit/observability"
+	"github.com/harnamsingh/go-servicekit/observability"
 )
 
 // Chain wraps handler with middlewares applied outermost-first.
