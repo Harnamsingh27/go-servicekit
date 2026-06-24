@@ -1,72 +1,88 @@
 package grpcx
 
 import (
-	"context"
-	"fmt"
 	"net"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
-	"google.golang.org/grpc/reflection"
 )
 
-// Server wraps grpc.Server with a built-in gRPC Health service and standard
-// interceptors (request-ID propagation). Additional server options — e.g.
-// auth interceptors — can be passed at construction time.
+// ServerOption configures a grpcx Server.
+type ServerOption func(*serverConfig)
+
+type serverConfig struct {
+	unary  []grpc.UnaryServerInterceptor
+	stream []grpc.StreamServerInterceptor
+	opts   []grpc.ServerOption
+}
+
+// WithUnaryInterceptors appends unary server interceptors.
+// They are chained in the order provided (first = outermost wrapper).
+func WithUnaryInterceptors(interceptors ...grpc.UnaryServerInterceptor) ServerOption {
+	return func(c *serverConfig) { c.unary = append(c.unary, interceptors...) }
+}
+
+// WithStreamInterceptors appends stream server interceptors.
+func WithStreamInterceptors(interceptors ...grpc.StreamServerInterceptor) ServerOption {
+	return func(c *serverConfig) { c.stream = append(c.stream, interceptors...) }
+}
+
+// WithGRPCOptions appends raw grpc.ServerOption values.
+func WithGRPCOptions(opts ...grpc.ServerOption) ServerOption {
+	return func(c *serverConfig) { c.opts = append(c.opts, opts...) }
+}
+
+// Server wraps grpc.Server with health checking and a structured interceptor chain.
 type Server struct {
 	inner  *grpc.Server
 	health *health.Server
-	addr   string
 }
 
-// NewServer creates a gRPC server listening on addr. Extra grpc.ServerOptions
-// (interceptors, credentials, etc.) are appended after the built-in ones.
-func NewServer(addr string, opts ...grpc.ServerOption) *Server {
-	base := []grpc.ServerOption{
-		grpc.ChainUnaryInterceptor(requestIDUnaryInterceptor),
-		grpc.ChainStreamInterceptor(requestIDStreamInterceptor),
+// NewServer creates a Server. It automatically registers the gRPC health service.
+func NewServer(opts ...ServerOption) *Server {
+	cfg := &serverConfig{}
+	for _, o := range opts {
+		o(cfg)
 	}
-	srv := grpc.NewServer(append(base, opts...)...)
+
+	serverOpts := append([]grpc.ServerOption{}, cfg.opts...)
+	if len(cfg.unary) > 0 {
+		serverOpts = append(serverOpts, grpc.ChainUnaryInterceptor(cfg.unary...))
+	}
+	if len(cfg.stream) > 0 {
+		serverOpts = append(serverOpts, grpc.ChainStreamInterceptor(cfg.stream...))
+	}
+
+	gs := grpc.NewServer(serverOpts...)
 	hs := health.NewServer()
-	grpc_health_v1.RegisterHealthServer(srv, hs)
-	reflection.Register(srv)
-	return &Server{inner: srv, health: hs, addr: addr}
+	grpc_health_v1.RegisterHealthServer(gs, hs)
+	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+
+	return &Server{inner: gs, health: hs}
 }
 
-// RegisterService delegates to the underlying grpc.Server.
+// RegisterService registers a gRPC service implementation and marks it as SERVING
+// in the health server.
 func (s *Server) RegisterService(desc *grpc.ServiceDesc, impl any) {
 	s.inner.RegisterService(desc, impl)
+	s.health.SetServingStatus(desc.ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
 }
 
-// SetServingStatus updates the health-check status for service. Pass "" to set
-// the overall server status.
-func (s *Server) SetServingStatus(service string, st grpc_health_v1.HealthCheckResponse_ServingStatus) {
-	s.health.SetServingStatus(service, st)
+// Serve accepts connections on l and blocks until the server stops.
+func (s *Server) Serve(l net.Listener) error {
+	return s.inner.Serve(l)
 }
 
-// GRPCServer returns the underlying *grpc.Server for direct registration.
-func (s *Server) GRPCServer() *grpc.Server { return s.inner }
+// GracefulStop marks all services NOT_SERVING, then waits for active RPCs to
+// finish before stopping.
+func (s *Server) GracefulStop() {
+	s.health.Shutdown()
+	s.inner.GracefulStop()
+}
 
-// Serve starts the gRPC server and blocks until ctx is cancelled, then drains
-// connections gracefully.
-func (s *Server) Serve(ctx context.Context) error {
-	lis, err := net.Listen("tcp", s.addr)
-	if err != nil {
-		return fmt.Errorf("grpcx: listen %s: %w", s.addr, err)
-	}
-	errCh := make(chan error, 1)
-	go func() {
-		if err := s.inner.Serve(lis); err != nil {
-			errCh <- fmt.Errorf("grpcx: serve: %w", err)
-		}
-		close(errCh)
-	}()
-	select {
-	case err := <-errCh:
-		return err
-	case <-ctx.Done():
-		s.inner.GracefulStop()
-	}
-	return <-errCh
+// Stop forcefully terminates all connections and stops the server.
+func (s *Server) Stop() {
+	s.health.Shutdown()
+	s.inner.Stop()
 }

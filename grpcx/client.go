@@ -2,55 +2,96 @@ package grpcx
 
 import (
 	"context"
+	"fmt"
+	"time"
 
-	"github.com/harnamsingh/go-servicekit/observability"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/metadata"
 )
 
-// Dial creates a new gRPC client connection to target using insecure
-// transport by default. Pass additional DialOptions to override credentials or
-// add interceptors. The connection is established lazily on the first RPC call.
-func Dial(target string, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
-	defaults := []grpc.DialOption{
+const (
+	defaultDialTimeout = 5 * time.Second
+	defaultRetryPolicy = `{
+		"methodConfig": [{
+			"name": [{}],
+			"retryPolicy": {
+				"maxAttempts": 4,
+				"initialBackoff": "0.1s",
+				"maxBackoff": "2s",
+				"backoffMultiplier": 2,
+				"retryableStatusCodes": ["UNAVAILABLE", "RESOURCE_EXHAUSTED"]
+			}
+		}]
+	}`
+)
+
+// ClientOption configures NewClient.
+type ClientOption func(*clientConfig)
+
+type clientConfig struct {
+	dialTimeout        time.Duration
+	disableRetry       bool
+	unaryInterceptors  []grpc.UnaryClientInterceptor
+	streamInterceptors []grpc.StreamClientInterceptor
+	dialOpts           []grpc.DialOption
+}
+
+// WithDialTimeout sets the maximum time to wait for the connection to be established.
+func WithDialTimeout(d time.Duration) ClientOption {
+	return func(c *clientConfig) { c.dialTimeout = d }
+}
+
+// WithClientUnaryInterceptors appends unary client interceptors.
+func WithClientUnaryInterceptors(interceptors ...grpc.UnaryClientInterceptor) ClientOption {
+	return func(c *clientConfig) {
+		c.unaryInterceptors = append(c.unaryInterceptors, interceptors...)
+	}
+}
+
+// WithoutRetry disables the default retry service config.
+func WithoutRetry() ClientOption {
+	return func(c *clientConfig) { c.disableRetry = true }
+}
+
+// WithDialOptions appends raw grpc.DialOption values.
+func WithDialOptions(opts ...grpc.DialOption) ClientOption {
+	return func(c *clientConfig) { c.dialOpts = append(c.dialOpts, opts...) }
+}
+
+// NewClient dials target and returns a *grpc.ClientConn with sensible defaults:
+// insecure transport, built-in retry policy, and request-ID propagation.
+// Call conn.Close() when done.
+func NewClient(target string, opts ...ClientOption) (*grpc.ClientConn, error) {
+	cfg := &clientConfig{
+		dialTimeout: defaultDialTimeout,
+	}
+	for _, o := range opts {
+		o(cfg)
+	}
+
+	dialOpts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithChainUnaryInterceptor(propagateRequestIDUnary),
-		grpc.WithChainStreamInterceptor(propagateRequestIDStream),
 	}
-	return grpc.NewClient(target, append(defaults, opts...)...)
-}
 
-// propagateRequestIDUnary copies the request ID from the outgoing context into
-// gRPC metadata so the backend receives it.
-func propagateRequestIDUnary(
-	ctx context.Context,
-	method string,
-	req, reply any,
-	cc *grpc.ClientConn,
-	invoker grpc.UnaryInvoker,
-	opts ...grpc.CallOption,
-) error {
-	ctx = appendRequestIDMD(ctx)
-	return invoker(ctx, method, req, reply, cc, opts...)
-}
-
-// propagateRequestIDStream does the same for streaming calls.
-func propagateRequestIDStream(
-	ctx context.Context,
-	desc *grpc.StreamDesc,
-	cc *grpc.ClientConn,
-	method string,
-	streamer grpc.Streamer,
-	opts ...grpc.CallOption,
-) (grpc.ClientStream, error) {
-	ctx = appendRequestIDMD(ctx)
-	return streamer(ctx, desc, cc, method, opts...)
-}
-
-func appendRequestIDMD(ctx context.Context) context.Context {
-	if rid := observability.RequestIDFromContext(ctx); rid != "" {
-		return metadata.AppendToOutgoingContext(ctx, headerRequestID, rid)
+	if !cfg.disableRetry {
+		dialOpts = append(dialOpts, grpc.WithDefaultServiceConfig(defaultRetryPolicy))
 	}
-	return ctx
+
+	unary := append([]grpc.UnaryClientInterceptor{UnaryClientRequestID()}, cfg.unaryInterceptors...)
+	dialOpts = append(dialOpts, grpc.WithChainUnaryInterceptor(unary...))
+
+	if len(cfg.streamInterceptors) > 0 {
+		dialOpts = append(dialOpts, grpc.WithChainStreamInterceptor(cfg.streamInterceptors...))
+	}
+
+	dialOpts = append(dialOpts, cfg.dialOpts...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.dialTimeout)
+	defer cancel()
+
+	conn, err := grpc.DialContext(ctx, target, dialOpts...) //nolint:staticcheck
+	if err != nil {
+		return nil, fmt.Errorf("grpcx: dial %q: %w", target, err)
+	}
+	return conn, nil
 }
