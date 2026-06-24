@@ -2,127 +2,188 @@ package auth
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"net/http"
 	"strings"
 
-	"github.com/golang-jwt/jwt/v5"
+	gjwt "github.com/golang-jwt/jwt/v5"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
+
+	appErrors "github.com/harnamsingh/go-servicekit/errors"
 )
 
-// JWTConfig holds the settings used to verify incoming tokens.
-type JWTConfig struct {
-	// Secret is the HMAC-SHA256 key used to sign and verify HS256 tokens.
-	Secret []byte
+// VerifierOption configures a Verifier.
+type VerifierOption func(*verifierConfig)
+
+type verifierConfig struct {
+	issuer   string
+	audience []string
 }
 
-// ValidateToken parses and validates rawToken, returning the extracted Claims.
-func (c JWTConfig) ValidateToken(rawToken string) (*Claims, error) {
-	t, err := jwt.ParseWithClaims(rawToken, &Claims{}, func(t *jwt.Token) (any, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method %q", t.Header["alg"])
+// WithIssuer restricts accepted tokens to those with the given iss claim.
+func WithIssuer(iss string) VerifierOption {
+	return func(c *verifierConfig) { c.issuer = iss }
+}
+
+// WithAudience restricts accepted tokens to those containing one of the given
+// audience values.
+func WithAudience(aud ...string) VerifierOption {
+	return func(c *verifierConfig) { c.audience = aud }
+}
+
+// Verifier parses and validates a raw JWT string.
+type Verifier interface {
+	Verify(tokenString string) (*Claims, error)
+}
+
+// HMACVerifier verifies tokens signed with HMAC (HS256/HS384/HS512).
+type HMACVerifier struct {
+	secret []byte
+	cfg    verifierConfig
+}
+
+// NewHMACVerifier returns a Verifier that accepts HMAC-signed JWTs.
+func NewHMACVerifier(secret []byte, opts ...VerifierOption) *HMACVerifier {
+	v := &HMACVerifier{secret: secret}
+	for _, o := range opts {
+		o(&v.cfg)
+	}
+	return v
+}
+
+// Verify implements Verifier.
+func (v *HMACVerifier) Verify(tokenString string) (*Claims, error) {
+	return parseToken(tokenString, func(t *gjwt.Token) (any, error) {
+		if _, ok := t.Method.(*gjwt.SigningMethodHMAC); !ok {
+			return nil, ErrInvalidSignature
 		}
-		return c.Secret, nil
-	})
+		return v.secret, nil
+	}, v.cfg)
+}
+
+// parseToken is the shared token parsing logic used by all verifier types.
+func parseToken(tokenString string, keyFn gjwt.Keyfunc, cfg verifierConfig) (*Claims, error) {
+	parserOpts := []gjwt.ParserOption{gjwt.WithExpirationRequired()}
+	if cfg.issuer != "" {
+		parserOpts = append(parserOpts, gjwt.WithIssuer(cfg.issuer))
+	}
+	if len(cfg.audience) > 0 {
+		parserOpts = append(parserOpts, gjwt.WithAudience(cfg.audience[0]))
+	}
+
+	claims := &Claims{}
+	token, err := gjwt.ParseWithClaims(tokenString, claims, keyFn, parserOpts...)
 	if err != nil {
-		return nil, err
+		switch {
+		case errors.Is(err, gjwt.ErrTokenExpired):
+			return nil, ErrExpiredToken
+		case errors.Is(err, gjwt.ErrSignatureInvalid):
+			return nil, ErrInvalidSignature
+		default:
+			return nil, appErrors.Wrap(appErrors.CodeUnauthorized, "invalid token", err)
+		}
 	}
-	claims, ok := t.Claims.(*Claims)
-	if !ok || !t.Valid {
-		return nil, fmt.Errorf("invalid token claims")
+	c, ok := token.Claims.(*Claims)
+	if !ok || !token.Valid {
+		return nil, ErrInvalidToken
 	}
-	return claims, nil
+	return c, nil
 }
 
-// HTTPMiddleware returns an http.Handler that validates a Bearer token from the
-// Authorization header. Valid claims are stored in the request context via
-// WithClaims; missing or invalid tokens produce a 401 response.
-func (c JWTConfig) HTTPMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw := bearerToken(r.Header.Get("Authorization"))
-		if raw == "" {
-			http.Error(w, "missing or malformed Authorization header", http.StatusUnauthorized)
-			return
-		}
-		claims, err := c.ValidateToken(raw)
+// extractBearerToken pulls the token from an "Authorization: Bearer <token>" header.
+func extractBearerToken(authHeader string) (string, error) {
+	if authHeader == "" {
+		return "", ErrMissingToken
+	}
+	parts := strings.SplitN(authHeader, " ", 2)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
+		return "", ErrInvalidToken
+	}
+	return strings.TrimSpace(parts[1]), nil
+}
+
+// JWTMiddleware returns an HTTP middleware that validates a Bearer JWT in the
+// Authorization header and stores the parsed Claims in the request context
+// via WithClaims.
+func JWTMiddleware(v Verifier) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			raw, err := extractBearerToken(r.Header.Get("Authorization"))
+			if err != nil {
+				ae := new(appErrors.AppError)
+				if errors.As(err, &ae) {
+					http.Error(w, ae.Message, appErrors.ToHTTPStatus(err))
+				} else {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+				}
+				return
+			}
+			claims, err := v.Verify(raw)
+			if err != nil {
+				ae := new(appErrors.AppError)
+				if errors.As(err, &ae) {
+					http.Error(w, ae.Message, appErrors.ToHTTPStatus(err))
+				} else {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+				}
+				return
+			}
+			ctx := WithClaims(r.Context(), claims)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// JWTUnaryInterceptor returns a gRPC unary server interceptor that validates
+// the bearer token found in the incoming metadata "authorization" key.
+func JWTUnaryInterceptor(v Verifier) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		ctx, err := jwtFromMetadata(ctx, v)
 		if err != nil {
-			http.Error(w, "invalid or expired token", http.StatusUnauthorized)
-			return
+			return nil, appErrors.ToGRPCStatus(err).Err()
 		}
-		next.ServeHTTP(w, r.WithContext(WithClaims(r.Context(), claims)))
-	})
+		return handler(ctx, req)
+	}
 }
 
-// UnaryInterceptor is a gRPC unary server interceptor that validates a Bearer
-// token from the incoming "authorization" metadata key.
-func (c JWTConfig) UnaryInterceptor(
-	ctx context.Context,
-	req any,
-	_ *grpc.UnaryServerInfo,
-	handler grpc.UnaryHandler,
-) (any, error) {
+// JWTStreamInterceptor returns a gRPC stream server interceptor that validates
+// the bearer token found in the incoming metadata "authorization" key.
+func JWTStreamInterceptor(v Verifier) grpc.StreamServerInterceptor {
+	return func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		ctx, err := jwtFromMetadata(ss.Context(), v)
+		if err != nil {
+			return appErrors.ToGRPCStatus(err).Err()
+		}
+		return handler(srv, &wrappedStream{ServerStream: ss, ctx: ctx})
+	}
+}
+
+func jwtFromMetadata(ctx context.Context, v Verifier) (context.Context, error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
-		return nil, status.Error(codes.Unauthenticated, "missing metadata")
+		return ctx, ErrMissingToken
 	}
-	vals := md["authorization"]
+	vals := md.Get("authorization")
 	if len(vals) == 0 {
-		return nil, status.Error(codes.Unauthenticated, "missing authorization metadata")
+		return ctx, ErrMissingToken
 	}
-	raw := bearerToken(vals[0])
-	if raw == "" {
-		return nil, status.Error(codes.Unauthenticated, "malformed authorization metadata")
-	}
-	claims, err := c.ValidateToken(raw)
+	raw, err := extractBearerToken(vals[0])
 	if err != nil {
-		return nil, status.Errorf(codes.Unauthenticated, "invalid token: %v", err)
+		return ctx, err
 	}
-	return handler(WithClaims(ctx, claims), req)
+	claims, err := v.Verify(raw)
+	if err != nil {
+		return ctx, err
+	}
+	return WithClaims(ctx, claims), nil
 }
 
-// StreamInterceptor is a gRPC stream server interceptor that validates a Bearer
-// token from the incoming "authorization" metadata key.
-func (c JWTConfig) StreamInterceptor(
-	srv any,
-	ss grpc.ServerStream,
-	_ *grpc.StreamServerInfo,
-	handler grpc.StreamHandler,
-) error {
-	md, ok := metadata.FromIncomingContext(ss.Context())
-	if !ok {
-		return status.Error(codes.Unauthenticated, "missing metadata")
-	}
-	vals := md["authorization"]
-	if len(vals) == 0 {
-		return status.Error(codes.Unauthenticated, "missing authorization metadata")
-	}
-	raw := bearerToken(vals[0])
-	if raw == "" {
-		return status.Error(codes.Unauthenticated, "malformed authorization metadata")
-	}
-	claims, err := c.ValidateToken(raw)
-	if err != nil {
-		return status.Errorf(codes.Unauthenticated, "invalid token: %v", err)
-	}
-	return handler(srv, &wrappedStream{ServerStream: ss, ctx: WithClaims(ss.Context(), claims)})
-}
-
-// wrappedStream overrides the context on an existing ServerStream.
+// wrappedStream overrides the context carried by a grpc.ServerStream.
 type wrappedStream struct {
 	grpc.ServerStream
 	ctx context.Context
 }
 
+// Context returns the overridden context.
 func (w *wrappedStream) Context() context.Context { return w.ctx }
-
-// bearerToken extracts the token from a "Bearer <token>" header value.
-func bearerToken(h string) string {
-	const prefix = "Bearer "
-	if !strings.HasPrefix(h, prefix) {
-		return ""
-	}
-	return strings.TrimPrefix(h, prefix)
-}
